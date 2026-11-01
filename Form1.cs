@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Windows.Forms;
 
@@ -12,11 +14,73 @@ namespace frm_hosts_file_recovery
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
                          @"drivers\etc\hosts");
 
-        private static readonly string BackupsDir =
-            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Backups");
+        // Backups chứa nội dung sẽ được ghi thẳng vào hosts file hệ thống (với quyền admin).
+        // Nếu đặt cạnh file .exe (vốn hay nằm ở Desktop/Downloads — nơi mọi tiến trình không cần
+        // elevate của chính user đó vẫn ghi được), 1 tiến trình không-elevate (vd: malware chạy nền)
+        // có thể cấy sẵn 1 file .bak độc hại vào đó; sau đó chỉ cần user bấm "Restore from Backup"
+        // là nội dung độc hại được ghi vào hosts file với quyền Administrator.
+        // → Dùng %ProgramData% + ACL chỉ cho phép Administrators/SYSTEM ghi, chặn tiến trình
+        // không-elevate (kể cả chạy bởi cùng tài khoản admin) cấy file vào đây.
+        private static readonly string BackupsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+            "HostsFileRecoveryTool", "Backups");
 
         private static readonly Encoding Utf8NoBom =
             new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
+        /// <summary>Tạo BackupsDir (nếu chưa có) với ACL chỉ cho phép Administrators/SYSTEM.</summary>
+        private static void EnsureBackupsDirSecured()
+        {
+            if (Directory.Exists(BackupsDir)) return;
+
+            try
+            {
+                var security = new DirectorySecurity();
+                security.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
+
+                var inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
+                var admins  = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
+                var system  = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null);
+
+                security.AddAccessRule(new FileSystemAccessRule(
+                    admins, FileSystemRights.FullControl, inherit, PropagationFlags.None, AccessControlType.Allow));
+                security.AddAccessRule(new FileSystemAccessRule(
+                    system, FileSystemRights.FullControl, inherit, PropagationFlags.None, AccessControlType.Allow));
+
+                Directory.CreateDirectory(BackupsDir, security);
+            }
+            catch
+            {
+                // App luôn chạy với quyền Administrator (ép bởi app.manifest) nên nhánh này
+                // hiếm khi xảy ra; vẫn tạo thư mục bình thường để tính năng backup không bị hỏng hẳn.
+                Directory.CreateDirectory(BackupsDir);
+            }
+        }
+
+        /// <summary>
+        /// Ghi file theo kiểu atomic (ghi ra file tạm cùng thư mục rồi swap vào đích) để tránh
+        /// hosts file bị cắt cụt/hỏng nếu tiến trình bị kill hoặc máy mất điện giữa chừng khi ghi —
+        /// đặc biệt quan trọng với HostsPath vì đây chính là file mà tool này có nhiệm vụ "cứu".
+        /// </summary>
+        private static void AtomicWriteAllText(string path, string content, Encoding encoding)
+        {
+            string dir      = Path.GetDirectoryName(path);
+            string tempPath = Path.Combine(dir, Path.GetFileName(path) + ".tmp_" + Guid.NewGuid().ToString("N").Substring(0, 8));
+
+            File.WriteAllText(tempPath, content, encoding);
+            try
+            {
+                if (File.Exists(path))
+                    File.Replace(tempPath, path, destinationBackupFileName: null);
+                else
+                    File.Move(tempPath, path);
+            }
+            catch
+            {
+                try { if (File.Exists(tempPath)) File.Delete(tempPath); } catch { }
+                throw;
+            }
+        }
 
         // ─────────────────────────────────────────────
         // PHASE 1 – App Startup
@@ -93,10 +157,9 @@ namespace frm_hosts_file_recovery
             {
                 string content = File.ReadAllText(HostsPath, Utf8NoBom);
 
-                if (!Directory.Exists(BackupsDir))
-                    Directory.CreateDirectory(BackupsDir);
+                EnsureBackupsDirSecured();
 
-                string fileName = "hosts_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".bak";
+                string fileName = "hosts_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".bak";
                 string destPath = Path.Combine(BackupsDir, fileName);
                 File.WriteAllText(destPath, content, Utf8NoBom);
 
@@ -156,6 +219,24 @@ namespace frm_hosts_file_recovery
             catch (Exception ex)                { HandleGeneral(ex);    }
         }
 
+        /// <summary>Tự động lưu snapshot nội dung hosts hiện tại trước khi 1 thao tác restore ghi đè nó.</summary>
+        private static void AutoSnapshotCurrentHostsFile()
+        {
+            try
+            {
+                string current = File.ReadAllText(HostsPath, Utf8NoBom);
+                if (string.IsNullOrWhiteSpace(current)) return;
+
+                EnsureBackupsDirSecured();
+                string fileName = "autosave_before_restore_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") + ".bak";
+                File.WriteAllText(Path.Combine(BackupsDir, fileName), current, Utf8NoBom);
+            }
+            catch
+            {
+                // Backup tự động là tính năng phụ trợ — không chặn luồng restore chính nếu nó lỗi.
+            }
+        }
+
         /// <summary>Safe write pipeline: strip Read-Only → write → re-lock → flush DNS.</summary>
         private void PerformRestore(string newContent, string sourceLabel)
         {
@@ -177,15 +258,21 @@ namespace frm_hosts_file_recovery
                     wasReadOnly = (attrs & FileAttributes.ReadOnly) != 0;
                     if (wasReadOnly)
                         File.SetAttributes(HostsPath, attrs & ~FileAttributes.ReadOnly);
+
+                    // Tự động lưu snapshot nội dung hiện tại trước khi ghi đè — nếu không,
+                    // bấm nhầm "Restore Default" sẽ xoá vĩnh viễn các entry người dùng tự thêm
+                    // mà không có cách nào lấy lại.
+                    AutoSnapshotCurrentHostsFile();
                 }
 
-                File.WriteAllText(HostsPath, newContent, Utf8NoBom);
+                AtomicWriteAllText(HostsPath, newContent, Utf8NoBom);
 
                 File.SetAttributes(HostsPath,
                     File.GetAttributes(HostsPath) | FileAttributes.ReadOnly);
 
                 FlushDns();
 
+                ReloadBackupList();
                 LoadHostsFile();
                 MessageBox.Show("Restore successful! DNS cache has been flushed.",
                                 "Success", MessageBoxButtons.OK, MessageBoxIcon.Information);

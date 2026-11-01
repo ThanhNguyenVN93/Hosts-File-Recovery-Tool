@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [Unreleased]
+
+### Security
+- **Backups folder hardened**: moved from a folder next to the `.exe` (often Desktop/Downloads,
+  writable by any non-elevated process run by the same user) to
+  `%ProgramData%\HostsFileRecoveryTool\Backups\`, created with an ACL restricted to
+  Administrators/SYSTEM. Prevents a non-elevated process from planting a malicious `.bak` file
+  that later gets written into the system `hosts` file via "Restore from Backup" run elevated.
+
+### Added
+- Automatic snapshot of the current `hosts` file right before any restore overwrites it
+  (`autosave_before_restore_*.bak`), so an accidental "Restore Default" click is always recoverable.
+- Atomic write for restores (write to a temp file, then swap into place) so a crash or power loss
+  mid-write can no longer leave the `hosts` file truncated/corrupted.
+
+### Fixed
+- Startup OS-detection/backup-listing logic unaffected; backup filenames now include milliseconds
+  (`hosts_YYYYMMDD_HHmmss_fff.bak`) to avoid same-second collisions from rapid clicks.
+
+---
+
 ## [1.0.0] — 2026
 
 ### Added
